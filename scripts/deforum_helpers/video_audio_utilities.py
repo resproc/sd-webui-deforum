@@ -18,40 +18,48 @@ import os
 import cv2
 import shutil
 import math
-import requests
 import subprocess
 import time
 import tempfile
 import re 
 import glob
+import numpy as np
 import concurrent.futures
 from pathlib import Path
 from pkg_resources import resource_filename
 from modules.shared import state, opts
 from .general_utils import checksum, clean_gradio_path_strings, debug_print
+from basicsr.utils.download_util import load_file_from_url
 from .rich import console
 import shutil
 from threading import Thread
-try:
-  from modules.modelloader import load_file_from_url
-except:
-  print("Try to fallback to basicsr with older modules")
-  from basicsr.utils.download_util import load_file_from_url
+from .http_client import get_http_client
+
+SUPPORTED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "bmp", "webp"]
+SUPPORTED_VIDEO_EXTENSIONS = ["mov", "mpeg", "mp4", "m4v", "avi", "mpg", "webm"]
 
 def convert_image(input_path, output_path):
+    extension = get_extension_if_valid(input_path, SUPPORTED_IMAGE_EXTENSIONS)
+
+    if not extension:
+        return
+
     # Read the input image
-    img = cv2.imread(input_path)
-    # Get the file extension of the output path
-    out_ext = os.path.splitext(output_path)[1].lower()
+    if input_path.startswith('http://') or input_path.startswith('https://'):
+        resp = get_http_client().get(input_path, allow_redirects=True)
+        arr = np.asarray(bytearray(resp.content), dtype=np.uint8)
+        img = cv2.imdecode(arr, -1)
+    else: 
+        img = cv2.imread(input_path)
+
     # Convert the image to the specified output format
-    if out_ext == ".png":
+    if extension == "png":
         cv2.imwrite(output_path, img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
-    elif out_ext == ".jpg" or out_ext == ".jpeg":
+    elif extension == "jpg" or extension == "jpeg":
         cv2.imwrite(output_path, img, [cv2.IMWRITE_JPEG_QUALITY, 99])
-    elif out_ext == ".bmp":
-        cv2.imwrite(output_path, img)
     else:
-        print(f"Unsupported output format: {out_ext}")
+        cv2.imwrite(output_path, img)
+
 
 def get_ffmpeg_params(): # get ffmpeg params from webui's settings -> deforum tab. actual opts are set in deforum.py
     f_location = opts.data.get("deforum_ffmpeg_location", find_ffmpeg_binary())
@@ -90,7 +98,7 @@ def vid2frames(video_path, video_in_frame_path, n=1, overwrite=True, extract_fro
 
     video_path = clean_gradio_path_strings(video_path)
     # check vid path using a function and only enter if we get True
-    if is_vid_path_valid(video_path):
+    if get_extension_if_valid(video_path, SUPPORTED_VIDEO_EXTENSIONS):
 
         name = get_frame_name(video_path)
 
@@ -153,36 +161,50 @@ def vid2frames(video_path, video_in_frame_path, n=1, overwrite=True, extract_fro
         vidcap.release()
         return video_fps
 
-# make sure the video_path provided is an existing local file or a web URL with a supported file extension
-def is_vid_path_valid(video_path):
-    # make sure file format is supported!
-    file_formats = ["mov", "mpeg", "mp4", "m4v", "avi", "mpg", "webm"]
-    extension = video_path.rsplit('.', 1)[-1].lower()
-    # vid path is actually a URL, check it 
-    if video_path.startswith('http://') or video_path.startswith('https://'):
-        response = requests.head(video_path, allow_redirects=True)
-        extension = extension.rsplit('?', 1)[0] # remove query string before checking file format extension.
+# Make sure  path_to_check provided is an existing local file or a web URL with a supported file extension
+# Check Content-Disposition if necessary.
+# If so, return the extension. If not, raise an error.
+def get_extension_if_valid(path_to_check, acceptable_extensions: list[str] ) -> str:
+
+    if path_to_check.startswith('http://') or path_to_check.startswith('https://'):
+        extension = path_to_check.rsplit('?', 1)[0].rsplit('.', 1)[-1] # remove query string before checking file format extension.
+        if extension in acceptable_extensions:
+            return extension
+
+        # Path is actually a URL. Make sure it resolves and has a valid file extension.
+        response = get_http_client().head(path_to_check, allow_redirects=True)
+        if response.status_code != 200:
+            # Pre-signed URLs for GET requests might not like HEAD requests. Try a 0 range GET request.
+            debug_print("Failed  HEAD request, trying 0 range GET. Status code: " + str(response.status_code))
+            response = get_http_client().get(path_to_check, headers={'Range': 'bytes=0-0'}, allow_redirects=True)
+            if response.status_code != 200:
+                debug_print("Also failed 0 range GET. Status code: " + str(response.status_code))
+                raise ConnectionError(f"URL {path_to_check} is not valid. Response status code: {response.status_code}")        
+
+        content_disposition_extension = None
         content_disposition = response.headers.get('Content-Disposition')
-        if content_disposition and extension not in file_formats:
-            # Filename doesn't look valid, but perhaps the content disposition will say otherwise?
+        if content_disposition:
             match = re.search(r'filename="?(?P<filename>[^"]+)"?', content_disposition)
             if match:
-                extension = match.group('filename').rsplit('.', 1)[-1].lower()
-        if response.status_code == 404:
-            raise ConnectionError(f"Video URL {video_path} is not valid. Response status code: {response.status_code}")
-        elif response.status_code == 302:
-            response = requests.head(response.headers['location'], allow_redirects=True)
-        if response.status_code != 200:
-            raise ConnectionError(f"Video URL {video_path} is not valid. Response status code: {response.status_code}")
-        if extension not in file_formats:
-            raise ValueError(f"Video file {video_path} has format '{extension}', which is not supported. Supported formats are: {file_formats}")
+                content_disposition_extension = match.group('filename').rsplit('.', 1)[-1].lower()
+        
+        if content_disposition_extension in acceptable_extensions:
+            return content_disposition_extension
+        
+        raise ValueError(f"File {path_to_check} has format '{extension}' (from URL) or '{content_disposition_extension}' (from content disposition), which are not supported. Supported formats are: {acceptable_extensions}")
+    
     else:
-        video_path = os.path.realpath(video_path)
-        if not os.path.exists(video_path):
-            raise RuntimeError(f"Video path does not exist: {video_path}")
-        if extension not in file_formats:
-            raise ValueError(f"Video file {video_path} has format '{extension}', which is not supported. Supported formats are: {file_formats}")
-    return True
+        path_to_check = os.path.realpath(path_to_check)
+        extension = path_to_check.rsplit('.', 1)[-1].lower()
+        
+        if not os.path.exists(path_to_check):
+            raise RuntimeError(f"Path does not exist: {path_to_check}")
+        if extension in acceptable_extensions:
+            return extension
+            
+    raise ValueError(f"File {path_to_check} has format '{extension}', which is not supported. Supported formats are: {acceptable_extensions}")
+
+
 
 # quick-retreive frame count, FPS and H/W dimensions of a video (local or URL-based)
 def get_quick_vid_info(vid_path):
@@ -246,7 +268,7 @@ def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch
             if (audio_path.startswith('http://') or audio_path.startswith('https://')):
                 url = audio_path
                 print(f"Downloading audio file from: {url}")
-                response = requests.get(url, stream=True)
+                response = get_http_client().get(url, stream=True)
                 response.raise_for_status()
                 temp_file = tempfile.NamedTemporaryFile(delete=False)
                 # Write the content of the downloaded file into the temporary file
@@ -281,7 +303,7 @@ def ffmpeg_stitch_video(ffmpeg_location=None, fps=None, outmp4_path=None, stitch
             add_soundtrack_status = f"\rError adding audio to video: {e}"
             add_soundtrack_success = False
         finally:
-            if temp_file:
+            if temp_file is not None:
                 file_path = Path(temp_file.name)
                 file_path.unlink(missing_ok=True)
             

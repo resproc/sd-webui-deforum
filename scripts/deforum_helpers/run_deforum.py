@@ -163,7 +163,7 @@ def run_deforum(*args):
                 mp4 = open(mp4_path, 'rb').read()
                 data_url = f"data:video/mp4;base64, {b64encode(mp4).decode()}"
                 global last_vid_data
-                last_vid_data = f'<p style=\"font-weight:bold;margin-bottom:0em\">Deforum extension for auto1111 — version 2.4b </p><video controls loop><source src="{data_url}" type="video/mp4"></video>'
+                last_vid_data = f'<p style=\"font-weight:bold;margin-bottom:0em\">Deforum extension for auto1111-0v1.9 — version 3.1 </p><video controls loop><source src="{data_url}" type="video/mp4"></video>'
             except Exception as e:
                 if need_to_frame_interpolate:
                     print(f"FFMPEG DID NOT STITCH ANY VIDEO. However, you requested to frame interpolate  - so we will continue to frame interpolation, but you'll be left only with the interpolated frames and not a video, since ffmpeg couldn't run. Original ffmpeg error: {e}")
